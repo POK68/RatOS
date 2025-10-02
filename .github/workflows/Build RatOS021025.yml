@@ -1,19 +1,115 @@
-    name: Build and Test
+# .github/workflows/build-ratos-image.yml
+name: Build RatOS Raspberry Images
 
-    on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to build (e.g. v2.1.0)'
+        required: true
+        default: 'v2.1.0'
+      create_release:
+        description: 'Create GitHub Release and attach artifacts'
+        required: false
+        default: 'false'
+  push:
+    tags:
+      - 'v*.*.*'
 
-    jobs:
-      build:
-        runs-on: ubuntu-latest
-        steps:
-        - uses: actions/checkout@v4
-        - name: Set up Node.js
-          uses: actions/setup-node@v4
-          with:
-            node-version: '20'
-        - name: Install dependencies
-          run: npm install
-        - name: Run tests
-          run: npm test
-        - name: Build project
-          run: npm run build
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build RatOS ({{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [pi32, pi64]
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      CREATE_RELEASE: ${{ github.event.inputs.create_release || 'false' }}
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TAG }}
+
+      - name: Set up QEMU (for ARM emulation)
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: linux/arm/v7,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install dependencies (apt) for build (qemu, debootstrap, etc.)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support qemu qemu-user qemu-system qemu-user-static debootstrap
+
+      - name: Make build script executable
+        run: |
+          if [ "${{ matrix.arch }}" = "pi64" ]; then
+            BUILD_SCRIPT=build-pi64.sh
+          else
+            BUILD_SCRIPT=build-pi32.sh
+          fi
+          echo "Using $BUILD_SCRIPT"
+          chmod +x ./${BUILD_SCRIPT}
+          echo "BUILD_SCRIPT=$BUILD_SCRIPT" >> $GITHUB_ENV
+
+      - name: Run build script
+        # The official repo provides build scripts (build-pi32.sh / build-pi64.sh).
+        # Adjust environment variables below if your scripts expect extra config.
+        run: |
+          set -euo pipefail
+          ./"$BUILD_SCRIPT"
+        timeout-minutes: 60
+
+      - name: Find generated images
+        id: findimgs
+        run: |
+          # common output name patterns: RatOS-*.img RatOS-*.img.xz
+          files=$(ls -1 **/RatOS-*.img* 2>/dev/null || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$files" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload image artifacts
+        if: steps.findimgs.outputs.files != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratos-${{ matrix.arch }}-${{ env.TAG }}
+          path: |
+            **/RatOS-*.img*
+          retention-days: 7
+
+  release:
+    name: Create Release (optional)
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.create_release == 'true')) || (startsWith(github.ref, 'refs/tags/')) }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: RatOS ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            Automated build of RatOS images for Raspberry Pi.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: artifacts/**/RatOS-*.img*
+          token: ${{ secrets.GITHUB_TOKEN }}
